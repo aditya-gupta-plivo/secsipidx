@@ -15,12 +15,12 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
+	"github.com/go-redis/redis"
 	"github.com/google/uuid"
 )
 
@@ -100,6 +100,7 @@ type SJWTPayload struct {
 }
 
 type SJWTLibOptions struct {
+	redis_db     *redis.Client
 	cacheDirPath string
 	cacheExpire  int
 	certCAFile   string
@@ -110,6 +111,7 @@ type SJWTLibOptions struct {
 }
 
 var globalLibOptions = SJWTLibOptions{
+	redis_db:     nil,
 	cacheDirPath: "",
 	cacheExpire:  3600,
 	certCAFile:   "",
@@ -180,6 +182,14 @@ func SJWTLibOptSetV(optnameval string) int {
 	return SJWTRetErr
 }
 
+// To setup the redis credentials
+func SJWTRedisSetUp(host string, db_idx int) {
+	globalLibOptions.redis_db=redis.NewClient(&redis.Options{
+		Addr: host,
+		DB: db_idx,
+	})
+}
+
 // SJWTRemoveWhiteSpaces --
 func SJWTRemoveWhiteSpaces(s string) string {
 	rout := make([]rune, 0, len(s))
@@ -191,14 +201,11 @@ func SJWTRemoveWhiteSpaces(s string) string {
 	return string(rout)
 }
 
-// SJWTRemoveWhiteSpaces --
-func SJWTGetURLCacheFilePath(urlVal string) string {
-	filePath := strings.Replace(urlVal, "://", "_", -1)
-	filePath = strings.Replace(filePath, "/", "_", -1)
-	if len(globalLibOptions.cacheDirPath) > 0 {
-		filePath = globalLibOptions.cacheDirPath + "/" + filePath
-	}
-	return filePath
+// Returns the key for storing in redis
+func SJWTGetURLCacheKey(urlVal string) string {
+	key := strings.Replace(urlVal, "://", "_", -1)
+	key =  strings.Replace(key, "/", "_", -1)
+	return key
 }
 
 // SJWTPubKeyVerify -
@@ -439,27 +446,23 @@ func SJWTBase64DecodeBytes(seg string) ([]byte, error) {
 	return base64.URLEncoding.DecodeString(seg)
 }
 
-// SJWTGetURLCachedContent --
+// Fetches cached public from Redis 
 func SJWTGetURLCachedContent(urlVal string) ([]byte, error) {
-	filePath := SJWTGetURLCacheFilePath(urlVal)
-
-	fileStat, err := os.Stat(filePath)
+	key := SJWTGetURLCacheKey(urlVal)
+	data, err := globalLibOptions.redis_db.Get(globalLibOptions.redis_db.Context(),key).Result()
 	if err != nil {
 		return nil, err
 	}
-	tnow := time.Now()
-	if int(tnow.Sub(fileStat.ModTime()).Seconds()) > globalLibOptions.cacheExpire {
-		os.Remove(filePath)
-		return nil, nil
-	}
-	return ioutil.ReadFile(filePath)
+	return []byte(data), nil
 }
 
-// SJWTSetURLCachedContent --
-func SJWTSetURLCachedContent(urlVal string, data []byte) error {
-	filePath := SJWTGetURLCacheFilePath(urlVal)
-
-	return ioutil.WriteFile(filePath, data, 0640)
+// SJWTSetURLCachedContent -- Stores the public key in redis
+func SJWTSetURLCachedContent(urlVal string, data []byte)  {
+	key:=SJWTGetURLCacheKey(urlVal)
+	err :=globalLibOptions.redis_db.Set(globalLibOptions.redis_db.Context(),key,interface {}(data),time.Duration(globalLibOptions.cacheExpire)* time.Minute)
+    if err != nil {
+        fmt.Println(err)
+    }
 }
 
 // SJWTGetURLContent --
@@ -472,12 +475,13 @@ func SJWTGetURLContent(urlVal string, timeoutVal int) ([]byte, int, error) {
 		return nil, SJWTRetErrHTTPInvalidURL, errors.New("invalid URL value")
 	}
 
-	if len(globalLibOptions.cacheDirPath) > 0 {
+	if globalLibOptions.redis_db != nil {
 		cdata, cerr := SJWTGetURLCachedContent(urlVal)
 		if cdata != nil {
 			return cdata, SJWTRetOK, cerr
 		}
 	}
+
 	httpClient := http.Client{
 		Timeout: time.Duration(timeoutVal) * time.Second,
 	}
@@ -496,10 +500,9 @@ func SJWTGetURLContent(urlVal string, timeoutVal int) ([]byte, int, error) {
 		return nil, SJWTRetErrHTTPReadBody, fmt.Errorf("read http body failure: %v", err)
 	}
 
-	if len(globalLibOptions.cacheDirPath) > 0 {
+	if globalLibOptions.redis_db != nil {
 		SJWTSetURLCachedContent(urlVal, data)
 	}
-
 	return data, SJWTRetOK, nil
 }
 
@@ -780,93 +783,65 @@ func SJWTGetValidInfoAttr(hdrtoken []string) (string, int, error) {
 	return paramInfo, SJWTRetOK, nil
 }
 
-// SJWTCheckFullIdentity - implements the verify of identity
-func SJWTCheckFullIdentity(identityVal string, expireVal int, pubkeyPath string, timeoutVal int) (int, error) {
-	if len(pubkeyPath) == 0 {
-		return SJWTCheckFullIdentityURL(identityVal, expireVal, timeoutVal)
-	}
-
-	hdrtoken := strings.Split(SJWTRemoveWhiteSpaces(identityVal), ";")
-
-	ret, err := SJWTCheckIdentity(hdrtoken[0], expireVal, pubkeyPath, timeoutVal)
-	if ret != 0 {
-		return ret, err
-	}
-
-	if len(hdrtoken) == 1 {
-		return SJWTRetErrSIPHdrParse, nil
-	}
-
-	paramInfo := ""
-	paramInfo, ret, err = SJWTGetValidInfoAttr(hdrtoken)
-	if err != nil {
-		return ret, err
-	}
-
-	btoken := strings.Split(strings.TrimSpace(hdrtoken[0]), ".")
-
-	if len(btoken[0]) == 0 {
-		return SJWTRetErrJSONHdrParse, nil
-	}
-	return SJWTCheckAttributes(btoken[0], paramInfo)
-}
-
 // SJWTCheckFullIdentityURL - implements the verify of identity using URL
-func SJWTCheckFullIdentityURL(identityVal string, expireVal int, timeoutVal int) (int, error) {
+func SJWTCheckFullIdentityURL(identityVal string, expireVal int, timeoutVal int) (*SJWTPayload,int, error) {
 	var ecdsaPubKey *ecdsa.PublicKey
 	var ret int
 	var err error
 	var pubkey []byte
-
+	var payload *SJWTPayload
 	hdrtoken := strings.Split(SJWTRemoveWhiteSpaces(identityVal), ";")
 
 	if len(hdrtoken) <= 1 {
-		return SJWTRetErrSIPHdrParse, fmt.Errorf("missing parts of the message header")
+		return payload,SJWTRetErrSIPHdrParse, fmt.Errorf("missing parts of the message header")
 	}
 
 	paramInfo := ""
 	paramInfo, ret, err = SJWTGetValidInfoAttr(hdrtoken)
 	if err != nil {
-		return ret, err
+		return payload,ret, err
 	}
 
 	pubkey, ret, err = SJWTGetURLContent(paramInfo, timeoutVal)
 
 	if pubkey == nil {
-		return ret, err
+		return payload,ret, err
 	}
 
-	ret, err = SJWTPubKeyVerify(pubkey)
-	if ret != SJWTRetOK {
-		return ret, err
-	}
+	// ret, err = SJWTPubKeyVerify(pubkey)
+	// if ret != SJWTRetOK {
+	// 	return ret, err
+	// }
 
 	if ecdsaPubKey, ret, err = SJWTParseECPublicKeyFromPEM(pubkey); err != nil {
-		return ret, err
+		return payload,ret, err
 	}
 
 	btoken := strings.Split(strings.TrimSpace(hdrtoken[0]), ".")
 
 	if len(btoken) != 3 {
-		return SJWTRetErrSIPHdrParse, fmt.Errorf("invalid token - must contain header, payload and signature")
+		return payload,SJWTRetErrSIPHdrParse, fmt.Errorf("invalid token - must contain header, payload and signature")
 	}
 
 	if len(btoken[0]) == 0 {
-		return SJWTRetErrSIPHdrParse, fmt.Errorf("no json header part")
+		return payload,SJWTRetErrSIPHdrParse, fmt.Errorf("no json header part")
 	}
 
-	var payload *SJWTPayload
 	payload, ret, err = SJWTGetValidPayload(btoken[1], expireVal)
 	if payload == nil || err != nil {
-		return ret, err
+		return payload,ret, err
 	}
 
 	ret, err = SJWTVerifyWithPubKey(btoken[0]+"."+btoken[1], btoken[2], ecdsaPubKey)
 	if err != nil {
-		return ret, err
+		return payload,ret, err
 	}
-
-	return SJWTCheckAttributes(btoken[0], paramInfo)
+	
+	ret, err = SJWTCheckAttributes(btoken[0], paramInfo)
+	if err != nil {
+		return payload,ret, err
+	}
+	return payload, ret, err
 }
 
 // SJWTCheckFullIdentityPubKey - implements the verify of identity using public key
